@@ -23,12 +23,13 @@ const app = express()
 // Enable CORS with specific origin for enhanced security
 app.use(cors({
     credentials : true,
-    origin : process.env.FRONTEND_URL
+    // origin : process.env.FRONTEND_URL
+    origin : true
 }))
 app.use(express.json())
 app.use(cookieParser())
 app.use(helmet({
-    crossOriginResourcePolicy : false
+    // crossOriginResourcePolicy : false
 }))
 
 const PORT = process.env.PORT || 8000
