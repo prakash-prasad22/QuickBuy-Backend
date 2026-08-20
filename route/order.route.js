@@ -4,6 +4,7 @@ import { admin } from '../middleware/Admin.js'
 import { seller } from '../middleware/seller.js' 
 import { 
     CashOnDeliveryOrderController, 
+    createPaymentIntentController, 
     getAllOrders, 
     getOrderDetailsController, 
     getSellerOrders, 
@@ -21,6 +22,9 @@ orderRouter.post("/cash-on-delivery",auth,CashOnDeliveryOrderController)
 
 // Process order payment (requires authentication)
 orderRouter.post('/checkout',auth,paymentController)
+
+// Process order payment for mobile
+orderRouter.post('/create-payment-intent', auth, createPaymentIntentController);
 
 // Handle Stripe webhook (for payment updates)
 orderRouter.post('/webhook',webhookStripe)

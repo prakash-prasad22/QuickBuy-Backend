@@ -147,6 +147,70 @@ export async function paymentController(request,response){
     }
 }
 
+/**
+ * Handles online payments using Stripe for mobile
+ */ 
+export const createPaymentIntentController = async (request, response) => {
+  try {
+    const userId = request.userId;
+    const { list_items, addressId, subTotalAmt, totalAmt } = request.body;
+
+    if (!list_items || list_items.length === 0) {
+      return response.status(400).json({
+        message: "Cart is empty",
+        error: true,
+        success: false,
+      });
+    }
+
+    if (!addressId) {
+      return response.status(400).json({
+        message: "Provide delivery address",
+        error: true,
+        success: false,
+      });
+    }
+
+    // Convert total amount to smallest currency unit (paise for INR / cents for USD)
+    const amountInCents = Math.round(totalAmt * 100);
+
+    // Minimize item data for Stripe's 500-char metadata limit per field
+    const itemsMetaData = list_items.map((item) => ({
+      id: item.productId._id || item.productId,
+      qty: item.quantity,
+      price: pricewithDiscount(item.productId.price, item.productId.discount),
+      seller: item.productId.seller,
+      deliveryOptions: item.productId.category?.[0]?.deliveryOptions || "standard",
+    }));
+
+    const paymentIntent = await Stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: "inr", // Ensure this matches your account currency
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        userId: userId.toString(),
+        addressId: addressId.toString(),
+        subTotalAmt: subTotalAmt.toString(),
+        totalAmt: totalAmt.toString(),
+        items: JSON.stringify(itemsMetaData),
+      },
+    });
+
+    return response.status(200).json({
+      client_secret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+      success: true,
+      error: false,
+    });
+  } catch (error) {
+    return response.status(500).json({
+      message: error.message || error,
+      error: true,
+      success: false,
+    });
+  }
+};
+
 
 const getOrderProductItems = async({
     lineItems,
@@ -197,52 +261,127 @@ const getOrderProductItems = async({
 /**
  * Processes Stripe webhook events
  */
-export async function webhookStripe(request,response){
-    const event = request.body;
-    const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
 
-    console.log("event",event)
+// export async function webhookStripe(request,response){
+//     const event = request.body;
+//     const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
 
-    // Handle the event
-  switch (event.type) {
-    case 'checkout.session.completed':
-      const session = event.data.object;
-      const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
-      const userId = session.metadata.userId
-      const orderProduct = await getOrderProductItems(
-        {
-            lineItems : lineItems,
-            userId : userId,
-            addressId : session.metadata.addressId,
-            paymentId  : session.payment_intent,
-            payment_status : session.payment_status,
-        })
+//     console.log("event",event)
+
+//     // Handle the event
+//   switch (event.type) {
+//     case 'checkout.session.completed':
+//       const session = event.data.object;
+//       const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
+//       const userId = session.metadata.userId
+//       const orderProduct = await getOrderProductItems(
+//         {
+//             lineItems : lineItems,
+//             userId : userId,
+//             addressId : session.metadata.addressId,
+//             paymentId  : session.payment_intent,
+//             payment_status : session.payment_status,
+//         })
     
-      const order = await OrderModel.insertMany(orderProduct)
+//       const order = await OrderModel.insertMany(orderProduct)
 
-      // Update stock 
-      for (const orderItem of order) {
-        const product = await ProductModel.findById(orderItem.productId);
-        if (product) {
-          product.stock -= orderItem.quantity; 
-          await product.save();
-        }
-      }
+//       // Update stock 
+//       for (const orderItem of order) {
+//         const product = await ProductModel.findById(orderItem.productId);
+//         if (product) {
+//           product.stock -= orderItem.quantity; 
+//           await product.save();
+//         }
+//       }
 
-        if(Boolean(order[0])){
-            const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
-                shopping_cart : []
-            })
-            const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
-        }
+//         if(Boolean(order[0])){
+//             const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
+//                 shopping_cart : []
+//             })
+//             const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
+//         }
+//       break;
+//     default:
+//       console.log(`Unhandled event type ${event.type}`);
+//   }
+
+//   // Return a response to acknowledge receipt of the event
+//   response.json({received: true});
+// }
+
+
+export const webhookStripe = async (request, response) => {
+  const sig = request.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+
+  try {
+    event = Stripe.webhooks.constructEvent(request.body, sig, endpointSecret);
+  } catch (err) {
+    console.error(`Webhook Error: ${err.message}`);
+    return response.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  switch (event.type) {
+    // 1. Web Flow
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      await handleWebOrder(session);
       break;
+    }
+
+    // 2. React Native Mobile Flow
+    case 'payment_intent.succeeded': {
+      const paymentIntent = event.data.object;
+      await handleMobileOrder(paymentIntent);
+      break;
+    }
+
     default:
       console.log(`Unhandled event type ${event.type}`);
   }
 
-  // Return a response to acknowledge receipt of the event
-  response.json({received: true});
-}
+  response.status(200).json({ received: true });
+};
+
+// Helper: Mobile PaymentIntent Fulfillment
+const handleMobileOrder = async (paymentIntent) => {
+  const { userId, addressId, subTotalAmt, totalAmt, items } = paymentIntent.metadata;
+  const parsedItems = JSON.parse(items);
+
+  const orderPayload = parsedItems.map((item) => ({
+    userId,
+    orderId: `ORD-MOB-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    productId: item.id,
+    product_details: {
+      name: "Mobile Order Item",
+      image: [],
+    },
+    paymentId: paymentIntent.id,
+    payment_status: "PAID",
+    delivery_address: addressId,
+    subTotalAmt: Number(subTotalAmt),
+    totalAmt: Number(totalAmt),
+    quantity: item.qty,
+    seller: item.seller,
+    deliveryOptions: item.deliveryOptions,
+  }));
+
+  // Insert orders
+  await OrderModel.insertMany(orderPayload);
+
+  // Decrement stock
+  for (const item of parsedItems) {
+    await ProductModel.findByIdAndUpdate(item.id, {
+      $inc: { stock: -item.qty },
+    });
+  }
+
+  // Clear user cart and update user order history
+  await CartProductModel.deleteMany({ userId });
+  await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+};
 
 /**
  * Retrieves order details for a specific user
