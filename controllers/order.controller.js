@@ -251,34 +251,73 @@ export async function webhookStripe(request, response) {
       break;
     }
 
-    case "payment_intent.succeeded": {
-      const paymentIntent = event.data.object;
-      const { userId, addressId, subTotalAmt, totalAmt, payment_type } = paymentIntent.metadata;
+    case 'payment_intent.succeeded': {
+  const paymentIntent = event.data.object;
 
-      // ONLY process payment_intent.succeeded if it came from the mobile app.
-      // Web orders are handled exclusively by 'checkout.session.completed'.
-      if (payment_type !== "mobile") {
-        console.log(`Skipping payment_intent.succeeded for non-mobile payment (${payment_type || "web"})`);
-        break;
-      }
+  // 1. Skip if triggered by Checkout Session to prevent duplicate processing
+  if (paymentIntent.invoice || paymentIntent.metadata?.type === "checkout") {
+    break;
+  }
 
-      if (!userId) {
-        console.error("Missing userId in PaymentIntent metadata");
-        break;
-      }
+  const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
 
-      console.log(`Processing Mobile Order for User: ${userId}`);
+  console.log("--> Webhook Received payment_intent.succeeded for User:", userId);
 
-      await processOrderAndClearCart({
-        userId,
-        addressId,
-        subTotalAmt,
-        totalAmt,
-        paymentId: paymentIntent.id,
-        paymentStatus: "PAID",
-      });
-      break;
-    }
+  if (!userId) {
+    console.error("❌ CRITICAL: Missing userId in PaymentIntent metadata!");
+    break;
+  }
+
+  // 2. Query cart items using ObjectId cast
+  const cartItems = await CartProductModel.find({ 
+    userId: new mongoose.Types.ObjectId(userId) 
+  }).populate('productId');
+
+  console.log(`--> Found ${cartItems.length} cart items for user ${userId}`);
+
+  if (!cartItems || cartItems.length === 0) {
+    console.error("❌ CRITICAL: No cart items found in DB for this user at time of webhook execution!");
+    break;
+  }
+
+  // 3. Build order payload
+  const orderPayload = cartItems.map((item) => ({
+    userId: new mongoose.Types.ObjectId(userId),
+    orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+    productId: item.productId._id,
+    product_details: {
+      name: item.productId.name,
+      image: item.productId.image,
+      seller: item.productId.seller,
+      deliveryOptions: item.productId.category[0]?.deliveryOptions || "",
+      price: pricewithDiscount(item.productId.price, item.productId.discount),
+    },
+    paymentId: paymentIntent.id,
+    payment_status: "PAID",
+    delivery_address: addressId,
+    quantity: item.quantity,
+    subTotalAmt: Number(subTotalAmt),
+    totalAmt: Number(totalAmt),
+  }));
+
+  // 4. Insert orders
+  const orders = await OrderModel.insertMany(orderPayload);
+  console.log(`✅ Created ${orders.length} orders successfully`);
+
+  // 5. Update Stock
+  for (const orderItem of orders) {
+    await ProductModel.findByIdAndUpdate(orderItem.productId, {
+      $inc: { stock: -orderItem.quantity },
+    });
+  }
+
+  // 6. Clear Cart
+  await CartProductModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+
+  console.log(`✅ Cart successfully cleared for user ${userId}`);
+  break;
+}
 
     default:
       console.log(`Unhandled event type: ${event.type}`);
