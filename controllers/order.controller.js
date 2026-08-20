@@ -2,439 +2,396 @@ import Stripe from "../config/stripe.js";
 import CartProductModel from "../models/cartproduct.model.js";
 import OrderModel from "../models/order.model.js";
 import UserModel from "../models/user.model.js";
-import ProductModel from "../models/product.model.js";
+import ProductModel from "../models/product.model.js"
 import mongoose from "mongoose";
+
 
 /**
  * Calculates the discounted price of a product
+ * @param {number} price - Original price of the product
+ * @param {number} discount - Discount percentage (default: 1)
+ * @returns {number} Discounted price
  */
-export const pricewithDiscount = (price, dis = 1) => {
-  const discountAmount = Math.ceil((Number(price) * Number(dis)) / 100);
-  return Number(price) - Number(discountAmount);
-};
+export const pricewithDiscount = (price,dis = 1)=>{
+    const discountAmout = Math.ceil((Number(price) * Number(dis)) / 100)
+    const actualPrice = Number(price) - Number(discountAmout)
+    return actualPrice
+}
+
 
 /**
- * Cash On Delivery Controller
- */
-export async function CashOnDeliveryOrderController(request, response) {
-  try {
-    const userId = request.userId;
-    const { list_items, totalAmt, addressId, subTotalAmt } = request.body;
+ * Handles Cash On Delivery orders and stock updation
+ **/
+ export async function CashOnDeliveryOrderController(request,response){
+    try {
+        const userId = request.userId // auth middleware 
+        const { list_items, totalAmt, addressId,subTotalAmt } = request.body 
 
-    const payload = list_items.map((el) => ({
-      userId: userId,
-      orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-      productId: el.productId._id,
-      product_details: {
-        name: el.productId.name,
-        image: el.productId.image,
-        seller: el.productId.seller,
-        deliveryOptions: el.productId.category[0]?.deliveryOptions,
-        price: pricewithDiscount(el.productId.price, el.productId.discount),
-      },
-      paymentId: "",
-      payment_status: "CASH ON DELIVERY",
-      delivery_address: addressId,
-      subTotalAmt: subTotalAmt,
-      totalAmt: totalAmt,
-      quantity: el.quantity,
-    }));
+        // Prepare order data for each item
+        const payload = list_items.map(el => {
+            return({
+                userId : userId,
+                orderId : `ORD-${new mongoose.Types.ObjectId()}`,
+                productId : el.productId._id, 
+                product_details : {
+                    name : el.productId.name,
+                    image : el.productId.image,
+                    seller : el.productId.seller,
+                    deliveryOptions : el.productId.category[0].deliveryOptions,
+                    price : pricewithDiscount(el.productId.price,el.productId.discount)
+                },
+                paymentId : "",
+                payment_status : "CASH ON DELIVERY",
+                delivery_address : addressId ,
+                subTotalAmt  : subTotalAmt,
+                totalAmt  :  totalAmt,
+                quantity: el.quantity,
+            })
+        })
 
-    const generatedOrder = await OrderModel.insertMany(payload);
+        const generatedOrder = await OrderModel.insertMany(payload)
+  
+        // Update stock for Cash on Delivery
+        for (const orderItem of generatedOrder) {
+          const product = await ProductModel.findById(orderItem.productId);
+          if (product) {
+            product.stock -= orderItem.quantity; 
+            await product.save();
+          }
+        }
 
-    // Update stock
-    for (const orderItem of generatedOrder) {
-      await ProductModel.findByIdAndUpdate(orderItem.productId, {
-        $inc: { stock: -orderItem.quantity },
-      });
+
+        ///remove from the cart
+        const removeCartItems = await CartProductModel.deleteMany({ userId : userId })
+        const updateInUser = await UserModel.updateOne({ _id : userId }, { shopping_cart : []})
+
+        return response.json({
+            message : "Order successfully placed",
+            error : false,
+            success : true,
+            data : generatedOrder
+        })
+
+    } catch (error) {
+        return response.status(500).json({
+            message : error.message || error ,
+            error : true,
+            success : false
+        })
     }
-
-    // Clear cart
-    await CartProductModel.deleteMany({ userId: userId });
-    await UserModel.updateOne({ _id: userId }, { shopping_cart: [] });
-
-    return response.json({
-      message: "Order successfully placed",
-      error: false,
-      success: true,
-      data: generatedOrder,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
 }
 
 /**
- * Handles Web Stripe Checkout Session
- */
-export async function paymentController(request, response) {
-  try {
-    const userId = request.userId;
-    const { list_items, totalAmt, addressId, subTotalAmt } = request.body;
+ * Handles online payments using Stripe
+ */ 
 
-    const user = await UserModel.findById(userId);
+export async function paymentController(request,response){
+    try {
+        const userId = request.userId // auth middleware 
+        const { list_items, totalAmt, addressId,subTotalAmt } = request.body 
 
-    const line_items = list_items.map((item) => ({
-      price_data: {
-        currency: "inr",
-        product_data: {
-          name: item.productId.name,
-          images: Array.isArray(item.productId.image) ? item.productId.image : [item.productId.image],
-          metadata: {
-            productId: item.productId._id.toString(),
-            seller: item.productId.seller?.toString() || "",
-          },
-        },
-        unit_amount: pricewithDiscount(item.productId.price, item.productId.discount) * 100,
-      },
-      quantity: item.quantity,
-    }));
+        const user = await UserModel.findById(userId)
 
-    const params = {
-      submit_type: "pay",
-      mode: "payment",
-      payment_method_types: ["card"],
-      customer_email: user.email,
-      metadata: {
-        userId: userId.toString(),
-        addressId: addressId ? addressId.toString() : "",
-        subTotalAmt: subTotalAmt.toString(),
-        totalAmt: totalAmt.toString(),
-        payment_type: "web"
-      },
-      line_items: line_items,
-      success_url: `${process.env.FRONTEND_URL}/success`,
-      cancel_url: `${process.env.FRONTEND_URL}/cancel`,
-    };
+        const line_items  = list_items.map(item =>{
+            return{
+                price_data : {
+                    currency : 'inr',
+                    product_data : {
+                        name : item.productId.name,
+                        images : item.productId.image,
+                        metadata : {
+                            productId : item.productId._id,
+                            seller : item.productId.seller,
+                            deliveryOptions : item.productId.category[0].deliveryOptions,
+                            price : pricewithDiscount(item.productId.price,item.productId.discount)
+                        }
+                    },
+                    unit_amount : pricewithDiscount(item.productId.price,item.productId.discount) * 100,
+                     
+                },
+                adjustable_quantity : {
+                    enabled : true,
+                    minimum : 1
+                },
+                quantity : item.quantity
+            }
+        })
 
-    const session = await Stripe.checkout.sessions.create(params);
+        const params = {
+            submit_type : 'pay',
+            mode : 'payment',
+            payment_method_types : ['card'],
+            customer_email : user.email,
+            metadata : {
+                userId : userId,
+                addressId : addressId,
+                subTotalAmt : subTotalAmt,
+                totalAmt : totalAmt
+            },
+            line_items : line_items,
+            success_url : `${process.env.FRONTEND_URL}/success`,
+            cancel_url : `${process.env.FRONTEND_URL}/cancel`
 
-    return response.status(200).json(session);
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
-}
+        }
 
-/**
- * Handles Native Mobile PaymentIntent Creation
- */
-export async function mobilePaymentController(request, response) {
-  try {
-    const userId = request.userId;
-    const { totalAmt, addressId, subTotalAmt } = request.body;
+        const session = await Stripe.checkout.sessions.create(params)
 
-    const user = await UserModel.findById(userId);
+        return response.status(200).json(session)
 
-    if (!user) {
-      return response.status(404).json({
-        message: "User not found",
-        error: true,
-        success: false,
-      });
+    } catch (error) {
+        return response.status(500).json({
+            message : error.message || error,
+            error : true,
+            success : false
+        })
     }
-
-    const paymentIntent = await Stripe.paymentIntents.create({
-      amount: Math.round(Number(totalAmt) * 100),
-      currency: "inr",
-      payment_method_types: ["card"],
-      receipt_email: user.email,
-      metadata: {
-        userId: String(userId),
-        addressId: addressId ? String(addressId) : "",
-        subTotalAmt: String(subTotalAmt),
-        totalAmt: String(totalAmt),
-        payment_type: "mobile"
-      },
-    });
-
-    return response.status(200).json({
-      message: "Payment intent created successfully",
-      client_secret: paymentIntent.client_secret,
-      error: false,
-      success: true,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
 }
 
-/**
- * Helper: Processes order insertion and cart cleanup
- */
-const processOrderAndClearCart = async ({ userId, addressId, subTotalAmt, totalAmt, paymentId, paymentStatus }) => {
-  // Fetch cart items at the moment of payment completion
-  const cartItems = await CartProductModel.find({ userId }).populate("productId");
 
-  if (!cartItems || cartItems.length === 0) {
-    console.log(`No cart items found for user ${userId}`);
-    return;
-  }
-
-  const orderPayload = cartItems.map((item) => ({
+const getOrderProductItems = async({
+    lineItems,
     userId,
-    orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-    productId: item.productId._id,
-    product_details: {
-      name: item.productId.name,
-      image: item.productId.image,
-      seller: item.productId.seller,
-      deliveryOptions: item.productId.category?.[0]?.deliveryOptions || "",
-      price: pricewithDiscount(item.productId.price, item.productId.discount),
-    },
-    paymentId: paymentId,
-    payment_status: paymentStatus,
-    delivery_address: addressId,
-    quantity: item.quantity,
-    subTotalAmt: Number(subTotalAmt),
-    totalAmt: Number(totalAmt),
-  }));
+    addressId,
+    subTotalAmt,
+    totalAmt,
+    paymentId,
+    payment_status,
+ })=>{
+    const productList = []
 
-  const orders = await OrderModel.insertMany(orderPayload);
+    if(lineItems?.data?.length){
+        for(const item of lineItems.data){
+            const product = await Stripe.products.retrieve(item.price.product)
 
-  // Deduct Stock
-  for (const orderItem of orders) {
-    await ProductModel.findByIdAndUpdate(orderItem.productId, {
-      $inc: { stock: -orderItem.quantity },
-    });
-  }
+            const seller = product.metadata.seller;
+            const deliveryOptions = product.metadata.deliveryOptions;
+            const price = product.metadata.price;
 
-  // Clear Cart
-  await CartProductModel.deleteMany({ userId });
-  await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
-};
+            const paylod = {
+                userId : userId,
+                orderId : `ORD-${new mongoose.Types.ObjectId()}`,
+                productId : product.metadata.productId, 
+                product_details : {
+                    name : product.name,
+                    image : product.images,
+                    seller ,
+                    deliveryOptions ,
+                    price 
+                } ,
+                paymentId : paymentId,
+                payment_status : payment_status,
+                delivery_address : addressId,
+                quantity : item.quantity,
+                subTotalAmt  : subTotalAmt,
+                totalAmt  :  totalAmt ,
+            }
 
-/**
- * Webhook Handler
- */
-export async function webhookStripe(request, response) {
-  const sig = request.headers["stripe-signature"];
-  const endpointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY;
-
-  let event;
-
-  try {
-    event = Stripe.webhooks.constructEvent(request.body, sig, endpointSecret);
-  } catch (err) {
-    console.error(`Webhook Signature Verification Error: ${err.message}`);
-    return response.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  console.log(`Received Webhook Event: ${event.type}`);
-
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const session = event.data.object;
-      const { userId, addressId, subTotalAmt, totalAmt } = session.metadata;
-
-      console.log(`Processing Web Order for User: ${userId}`);
-
-      await processOrderAndClearCart({
-        userId,
-        addressId,
-        subTotalAmt,
-        totalAmt,
-        paymentId: session.payment_intent,
-        paymentStatus: session.payment_status === "paid" ? "PAID" : session.payment_status,
-      });
-      break;
+            productList.push(paylod)
+        }
     }
 
-    case 'payment_intent.succeeded': {
-  const paymentIntent = event.data.object;
-
-  // 1. Skip if triggered by Checkout Session to prevent duplicate processing
-  if (paymentIntent.invoice || paymentIntent.metadata?.type === "checkout") {
-    break;
-  }
-
-  const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
-
-  console.log("--> Webhook Received payment_intent.succeeded for User:", userId);
-
-  if (!userId) {
-    console.error("❌ CRITICAL: Missing userId in PaymentIntent metadata!");
-    break;
-  }
-
-  // 2. Query cart items using ObjectId cast
-  const cartItems = await CartProductModel.find({ 
-    userId: new mongoose.Types.ObjectId(userId) 
-  }).populate('productId');
-
-  console.log(`--> Found ${cartItems.length} cart items for user ${userId}`);
-
-  if (!cartItems || cartItems.length === 0) {
-    console.error("❌ CRITICAL: No cart items found in DB for this user at time of webhook execution!");
-    break;
-  }
-
-  // 3. Build order payload
-  const orderPayload = cartItems.map((item) => ({
-    userId: new mongoose.Types.ObjectId(userId),
-    orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-    productId: item.productId._id,
-    product_details: {
-      name: item.productId.name,
-      image: item.productId.image,
-      seller: item.productId.seller,
-      deliveryOptions: item.productId.category[0]?.deliveryOptions || "",
-      price: pricewithDiscount(item.productId.price, item.productId.discount),
-    },
-    paymentId: paymentIntent.id,
-    payment_status: "PAID",
-    delivery_address: addressId,
-    quantity: item.quantity,
-    subTotalAmt: Number(subTotalAmt),
-    totalAmt: Number(totalAmt),
-  }));
-
-  // 4. Insert orders
-  const orders = await OrderModel.insertMany(orderPayload);
-  console.log(`✅ Created ${orders.length} orders successfully`);
-
-  // 5. Update Stock
-  for (const orderItem of orders) {
-    await ProductModel.findByIdAndUpdate(orderItem.productId, {
-      $inc: { stock: -orderItem.quantity },
-    });
-  }
-
-  // 6. Clear Cart
-  await CartProductModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
-  await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
-
-  console.log(`✅ Cart successfully cleared for user ${userId}`);
-  break;
+    return productList
 }
 
+
+/**
+ * Processes Stripe webhook events
+ */
+export async function webhookStripe(request,response){
+    const event = request.body;
+    const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
+
+    console.log("event",event)
+
+    // Handle the event
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
+      const userId = session.metadata.userId
+      const orderProduct = await getOrderProductItems(
+        {
+            lineItems : lineItems,
+            userId : userId,
+            addressId : session.metadata.addressId,
+            paymentId  : session.payment_intent,
+            payment_status : session.payment_status,
+        })
+    
+      const order = await OrderModel.insertMany(orderProduct)
+
+      // Update stock 
+      for (const orderItem of order) {
+        const product = await ProductModel.findById(orderItem.productId);
+        if (product) {
+          product.stock -= orderItem.quantity; 
+          await product.save();
+        }
+      }
+
+        if(Boolean(order[0])){
+            const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
+                shopping_cart : []
+            })
+            const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
+        }
+      break;
     default:
-      console.log(`Unhandled event type: ${event.type}`);
+      console.log(`Unhandled event type ${event.type}`);
   }
 
-  return response.status(200).json({ received: true });
+  // Return a response to acknowledge receipt of the event
+  response.json({received: true});
 }
 
 /**
- * Orders Retrieval Controllers
+ * Retrieves order details for a specific user
  */
-export async function getOrderDetailsController(request, response) {
-  try {
-    const userId = request.userId;
-    const orderlist = await OrderModel.find({ userId }).sort({ createdAt: -1 }).populate("delivery_address");
+export async function getOrderDetailsController(request,response){
+    try {
+        const userId = request.userId // order id
 
-    return response.json({
-      message: "order list",
-      data: orderlist,
-      error: false,
-      success: true,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
+        const orderlist = await OrderModel.find({ userId : userId }).sort({ createdAt : -1 }).populate('delivery_address')
+
+        return response.json({
+            message : "order list",
+            data : orderlist,
+            error : false,
+            success : true
+        })
+    } catch (error) {
+        return response.status(500).json({
+            message : error.message || error,
+            error : true,
+            success : false
+        })
+    }
 }
 
+/**
+ * Retrieves all orders with optional filtering and pagination
+ */
 export async function getAllOrders(request, response) {
-  try {
-    const { page = 1, limit = 10, status } = request.query;
-    const skip = (page - 1) * limit;
+    try {
+      const { page = 1, limit = 10, status } = request.query; 
+      const skip = (page - 1) * limit; 
+  
+      const query = status ? {
+        orderStatus : status
+      } : {}
+  
+      /*if (search) {
+        query.$or = [
+          { 'product_details.name': { $regex: search, $options: 'i' } },
+          { 'userId.name': { $regex: search, $options: 'i' } },
+          { 'userId.email': { $regex: search, $options: 'i' } }, 
+          { 'product_details.seller':{ $regex: search, $options: 'i'} },
+          { orderId: { $regex: search, $options: 'i' } }, 
+        ];
+      }*/
+  
+      /*if (status) {
+        query.orderStatus = status;
 
-    const query = status ? { orderStatus: status } : {};
-
-    const orderList = await OrderModel.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(Number(limit))
-      .populate("delivery_address")
-      .populate({ path: "product_details.seller", select: "name email" })
-      .populate({ path: "userId", select: "name email" });
-
-    const totalOrders = await OrderModel.countDocuments(query);
-
-    return response.json({
-      message: "All Orders",
-      data: orderList,
-      totalOrders,
-      currentPage: Number(page),
-      totalPages: Math.ceil(totalOrders / limit),
-      error: false,
-      success: true,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
-}
-
-export async function getSellerOrders(request, response) {
-  try {
-    const { sellerId } = request.body;
-
-    const orders = await OrderModel.find({ "product_details.seller": sellerId })
-      .populate("delivery_address")
-      .populate({ path: "userId", select: "name email" });
-
-    return response.status(200).json({
-      message: "Seller Orders Retrieved Successfully",
-      data: orders,
-      error: false,
-      success: true,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
-}
-
-export const updateOrderStatus = async (request, response) => {
-  try {
-    const { orderId, orderStatus } = request.body;
-
-    const order = await OrderModel.findById(orderId);
-
-    if (!order) {
-      return response.status(404).json({
-        message: "Order not found",
+      }*/
+  
+      const orderList = await OrderModel.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .populate('delivery_address')
+        .populate({ 
+            path: 'product_details.seller', 
+            select: 'name email' // Select only required fields
+        })
+        .populate({ 
+            path: 'userId', 
+            select: 'name email' // Select only required fields
+        });
+  
+      const totalOrders = await OrderModel.countDocuments(query);
+  
+      return response.json({
+        message: "All Orders",
+        data: orderList,
+        totalOrders,
+        currentPage: Number(page),
+        totalPages: Math.ceil(totalOrders / limit),
+        error: false,
+        success: true,
+      });
+    } catch (error) {
+      return response.status(500).json({
+        message: error.message || error,
         error: true,
         success: false,
       });
     }
+}
 
-    order.orderStatus = orderStatus;
-    await order.save();
+/**
+ * Retrieves orders for a specific seller
+ */
+export async function getSellerOrders(request, response) { 
+    try {
+      const { sellerId } = request.body; 
+  
+      const orders = await OrderModel.find({ 
+        "product_details.seller" : sellerId
+      })
+        .populate('delivery_address')
+        .populate({ 
+          path: 'userId', 
+          select: 'name email' 
+        });
+  
+      return response.status(200).json({
+        message: "Seller Orders Retrieved Successfully",
+        data: orders,
+        error: false,
+        success: true,
+      });
+    } catch (error) {
+      return response.status(500).json({
+        message: error.message || error,
+        error: true,
+        success: false,
+      });
+    }
+}
 
-    return response.status(200).json({
-      message: "Order status updated successfully",
-      error: false,
-      success: true,
-      data: order,
-    });
-  } catch (error) {
-    return response.status(500).json({
-      message: error.message || error,
-      error: true,
-      success: false,
-    });
-  }
+/**
+ * Seller can update order Status 
+ */
+export const updateOrderStatus = async (request , response ) => {
+    try {
+      const { orderId , orderStatus } = request.body;
+  
+      const order = await OrderModel.findById(orderId);
+  
+      if (!order) {
+        return response.status(404).json({ 
+          message: "Order not found", 
+          error: true, 
+          success: false 
+        });
+      }
+  
+      order.orderStatus = orderStatus; 
+      await order.save();
+  
+      return response.status(200).json({ 
+        message: "Order status updated successfully", 
+        error: false, 
+        success: true, 
+        data: order 
+      });
+  
+    } catch (error) {
+      return response.status(500).json({ 
+        message: error.message || error, 
+        error: true, 
+        success: false 
+      });
+    }
 };
