@@ -245,91 +245,191 @@ const getOrderProductItems = async({
 /**
  * Processes Stripe webhook events
  */
-export async function webhookStripe(request,response){
-    const event = request.body;
-    const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
+// export async function webhookStripe(request,response){
+//     const event = request.body;
+//     const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
 
-    console.log("event",event)
+//     console.log("event",event)
 
-    // Handle the event
+//     // Handle the event
+//   switch (event.type) {
+//     case 'checkout.session.completed': {
+//       const session = event.data.object;
+//       const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
+//       const userId = session.metadata.userId
+//       const orderProduct = await getOrderProductItems(
+//         {
+//             lineItems : lineItems,
+//             userId : userId,
+//             addressId : session.metadata.addressId,
+//             paymentId  : session.payment_intent,
+//             payment_status : session.payment_status,
+//         })
+    
+//       const order = await OrderModel.insertMany(orderProduct)
+
+//       // Update stock 
+//       for (const orderItem of order) {
+//         const product = await ProductModel.findById(orderItem.productId);
+//         if (product) {
+//           product.stock -= orderItem.quantity; 
+//           await product.save();
+//         }
+//       }
+
+//         if(Boolean(order[0])){
+//             const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
+//                 shopping_cart : []
+//             })
+//             const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
+//         }
+//       break;
+//       }
+//     case 'payment_intent.succeeded': {
+//       const paymentIntent = event.data.object;
+//       const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
+
+//       // Fetch user's active cart to map items to the order
+//       const cartItems = await CartProductModel.find({ userId }).populate('productId');
+
+//       const orderPayload = cartItems.map((item) => ({
+//         userId,
+//         orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+//         productId: item.productId._id,
+//         product_details: {
+//           name: item.productId.name,
+//           image: item.productId.image,
+//           seller: item.productId.seller,
+//           deliveryOptions: item.productId.category[0]?.deliveryOptions,
+//           price: pricewithDiscount(item.productId.price, item.productId.discount),
+//         },
+//         paymentId: paymentIntent.id,
+//         payment_status: "PAID",
+//         delivery_address: addressId,
+//         quantity: item.quantity,
+//         subTotalAmt: Number(subTotalAmt),
+//         totalAmt: Number(totalAmt),
+//       }));
+
+//       const orders = await OrderModel.insertMany(orderPayload);
+
+//       // Update Stock & Clear Cart
+//       for (const orderItem of orders) {
+//         await ProductModel.findByIdAndUpdate(orderItem.productId, {
+//           $inc: { stock: -orderItem.quantity },
+//         });
+//       }
+
+//       await CartProductModel.deleteMany({ userId });
+//       await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+//       break;
+//     }
+//     default:
+//       console.log(`Unhandled event type ${event.type}`);
+//   }
+
+//   // Return a response to acknowledge receipt of the event
+//   response.json({received: true});
+// }
+
+export async function webhookStripe(request, response) {
+  const sig = request.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY;
+
+  let event;
+
+  try {
+    // Construct event using raw body buffer
+    event = Stripe.webhooks.constructEvent(request.body, sig, endpointSecret);
+  } catch (err) {
+    console.error(`Webhook Signature Verification Error: ${err.message}`);
+    return response.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object;
-      const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
-      const userId = session.metadata.userId
-      const orderProduct = await getOrderProductItems(
-        {
-            lineItems : lineItems,
-            userId : userId,
-            addressId : session.metadata.addressId,
-            paymentId  : session.payment_intent,
-            payment_status : session.payment_status,
-        })
-    
-      const order = await OrderModel.insertMany(orderProduct)
+      const lineItems = await Stripe.checkout.sessions.listLineItems(session.id);
+      const userId = session.metadata.userId;
 
-      // Update stock 
+      const orderProduct = await getOrderProductItems({
+        lineItems: lineItems,
+        userId: userId,
+        addressId: session.metadata.addressId,
+        paymentId: session.payment_intent,
+        payment_status: session.payment_status,
+        subTotalAmt: session.metadata.subTotalAmt,
+        totalAmt: session.metadata.totalAmt
+      });
+
+      const order = await OrderModel.insertMany(orderProduct);
+
       for (const orderItem of order) {
-        const product = await ProductModel.findById(orderItem.productId);
-        if (product) {
-          product.stock -= orderItem.quantity; 
-          await product.save();
-        }
+        await ProductModel.findByIdAndUpdate(orderItem.productId, {
+          $inc: { stock: -orderItem.quantity }
+        });
       }
 
-        if(Boolean(order[0])){
-            const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
-                shopping_cart : []
-            })
-            const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
-        }
-      break;
+      if (order.length > 0) {
+        await CartProductModel.deleteMany({ userId: userId });
+        await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
       }
+      break;
+    }
+
     case 'payment_intent.succeeded': {
       const paymentIntent = event.data.object;
       const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
 
-      // Fetch user's active cart to map items to the order
-      const cartItems = await CartProductModel.find({ userId }).populate('productId');
-
-      const orderPayload = cartItems.map((item) => ({
-        userId,
-        orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-        productId: item.productId._id,
-        product_details: {
-          name: item.productId.name,
-          image: item.productId.image,
-          seller: item.productId.seller,
-          deliveryOptions: item.productId.category[0]?.deliveryOptions,
-          price: pricewithDiscount(item.productId.price, item.productId.discount),
-        },
-        paymentId: paymentIntent.id,
-        payment_status: "PAID",
-        delivery_address: addressId,
-        quantity: item.quantity,
-        subTotalAmt: Number(subTotalAmt),
-        totalAmt: Number(totalAmt),
-      }));
-
-      const orders = await OrderModel.insertMany(orderPayload);
-
-      // Update Stock & Clear Cart
-      for (const orderItem of orders) {
-        await ProductModel.findByIdAndUpdate(orderItem.productId, {
-          $inc: { stock: -orderItem.quantity },
-        });
+      if (!userId) {
+        console.error("Missing userId in PaymentIntent metadata");
+        break;
       }
 
-      await CartProductModel.deleteMany({ userId });
-      await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+      // Fetch active items from DB using userId
+      const cartItems = await CartProductModel.find({ userId }).populate('productId');
+
+      if (cartItems && cartItems.length > 0) {
+        const orderPayload = cartItems.map((item) => ({
+          userId,
+          orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+          productId: item.productId._id,
+          product_details: {
+            name: item.productId.name,
+            image: item.productId.image,
+            seller: item.productId.seller,
+            deliveryOptions: item.productId.category[0]?.deliveryOptions,
+            price: pricewithDiscount(item.productId.price, item.productId.discount),
+          },
+          paymentId: paymentIntent.id,
+          payment_status: "PAID",
+          delivery_address: addressId,
+          quantity: item.quantity,
+          subTotalAmt: Number(subTotalAmt),
+          totalAmt: Number(totalAmt),
+        }));
+
+        const orders = await OrderModel.insertMany(orderPayload);
+
+        // Deduct inventory stock
+        for (const orderItem of orders) {
+          await ProductModel.findByIdAndUpdate(orderItem.productId, {
+            $inc: { stock: -orderItem.quantity },
+          });
+        }
+
+        // Clear Cart from Database & User Profile
+        await CartProductModel.deleteMany({ userId });
+        await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+      }
       break;
     }
+
     default:
-      console.log(`Unhandled event type ${event.type}`);
+      console.log(`Unhandled event type: ${event.type}`);
   }
 
-  // Return a response to acknowledge receipt of the event
-  response.json({received: true});
+  return response.status(200).json({ received: true });
 }
 
 /**
