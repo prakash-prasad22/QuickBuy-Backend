@@ -261,55 +261,6 @@ const getOrderProductItems = async({
 /**
  * Processes Stripe webhook events
  */
-
-// export async function webhookStripe(request,response){
-//     const event = request.body;
-//     const endPointSecret = process.env.STRIPE_ENPOINT_WEBHOOK_SECRET_KEY
-
-//     console.log("event",event)
-
-//     // Handle the event
-//   switch (event.type) {
-//     case 'checkout.session.completed':
-//       const session = event.data.object;
-//       const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
-//       const userId = session.metadata.userId
-//       const orderProduct = await getOrderProductItems(
-//         {
-//             lineItems : lineItems,
-//             userId : userId,
-//             addressId : session.metadata.addressId,
-//             paymentId  : session.payment_intent,
-//             payment_status : session.payment_status,
-//         })
-    
-//       const order = await OrderModel.insertMany(orderProduct)
-
-//       // Update stock 
-//       for (const orderItem of order) {
-//         const product = await ProductModel.findById(orderItem.productId);
-//         if (product) {
-//           product.stock -= orderItem.quantity; 
-//           await product.save();
-//         }
-//       }
-
-//         if(Boolean(order[0])){
-//             const removeCartItems = await  UserModel.findByIdAndUpdate(userId,{
-//                 shopping_cart : []
-//             })
-//             const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
-//         }
-//       break;
-//     default:
-//       console.log(`Unhandled event type ${event.type}`);
-//   }
-
-//   // Return a response to acknowledge receipt of the event
-//   response.json({received: true});
-// }
-
-
 export const webhookStripe = async (request, response) => {
   const sig = request.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -319,68 +270,83 @@ export const webhookStripe = async (request, response) => {
   try {
     event = Stripe.webhooks.constructEvent(request.body, sig, endpointSecret);
   } catch (err) {
-    console.error(`Webhook Error: ${err.message}`);
+    console.error(`Webhook Signature Verification Error: ${err.message}`);
     return response.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  switch (event.type) {
-    // 1. Web Flow
-    case 'checkout.session.completed': {
-      const session = event.data.object;
-      await handleWebOrder(session);
-      break;
-    }
-
-    // 2. React Native Mobile Flow
-    case 'payment_intent.succeeded': {
-      const paymentIntent = event.data.object;
-      await handleMobileOrder(paymentIntent);
-      break;
-    }
-
-    default:
-      console.log(`Unhandled event type ${event.type}`);
-  }
-
+  // 1. Send immediate 200 ACK to Stripe so it does NOT time out
   response.status(200).json({ received: true });
+
+  // 2. Process database execution asynchronously after responding
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        await handleWebOrder(session);
+        break;
+      }
+
+      case 'payment_intent.succeeded': {
+        const paymentIntent = event.data.object;
+        await handleMobileOrder(paymentIntent);
+        break;
+      }
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+  } catch (dbError) {
+    console.error("Error executing database operations in webhook:", dbError);
+  }
 };
 
 // Helper: Mobile PaymentIntent Fulfillment
 const handleMobileOrder = async (paymentIntent) => {
-  const { userId, addressId, subTotalAmt, totalAmt, items } = paymentIntent.metadata;
-  const parsedItems = JSON.parse(items);
+  try {
+    const { userId, addressId, subTotalAmt, totalAmt, items } = paymentIntent.metadata || {};
 
-  const orderPayload = parsedItems.map((item) => ({
-    userId,
-    orderId: `ORD-MOB-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    productId: item.id,
-    product_details: {
-      name: "Mobile Order Item",
-      image: [],
-    },
-    paymentId: paymentIntent.id,
-    payment_status: "PAID",
-    delivery_address: addressId,
-    subTotalAmt: Number(subTotalAmt),
-    totalAmt: Number(totalAmt),
-    quantity: item.qty,
-    seller: item.seller,
-    deliveryOptions: item.deliveryOptions,
-  }));
+    if (!items || !userId) {
+      console.error('Missing metadata fields in PaymentIntent:', paymentIntent.id);
+      return;
+    }
 
-  // Insert orders
-  await OrderModel.insertMany(orderPayload);
+    const parsedItems = JSON.parse(items);
 
-  // Decrement stock
-  for (const item of parsedItems) {
-    await ProductModel.findByIdAndUpdate(item.id, {
-      $inc: { stock: -item.qty },
-    });
+    const orderPayload = parsedItems.map((item) => ({
+      userId,
+      orderId: `ORD-MOB-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      productId: item.id,
+      product_details: {
+        name: "Mobile Order Item",
+        image: [],
+      },
+      paymentId: paymentIntent.id,
+      payment_status: "PAID",
+      delivery_address: addressId,
+      subTotalAmt: Number(subTotalAmt),
+      totalAmt: Number(totalAmt),
+      quantity: item.qty,
+      seller: item.seller,
+      deliveryOptions: item.deliveryOptions,
+    }));
+
+    // Batch DB updates
+    await OrderModel.insertMany(orderPayload);
+
+    // Parallel stock reduction
+    const stockUpdates = parsedItems.map((item) =>
+      ProductModel.findByIdAndUpdate(item.id, { $inc: { stock: -item.qty } })
+    );
+    await Promise.all(stockUpdates);
+
+    // Clear cart
+    await CartProductModel.deleteMany({ userId });
+    await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+
+    console.log(`Mobile order completed successfully for user: ${userId}`);
+  } catch (error) {
+    console.error('Error executing handleMobileOrder:', error);
   }
-
-  // Clear user cart and update user order history
-  await CartProductModel.deleteMany({ userId });
-  await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
 };
 
 /**
