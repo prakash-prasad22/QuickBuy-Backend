@@ -104,6 +104,7 @@ export async function paymentController(request, response) {
         addressId: addressId ? addressId.toString() : "",
         subTotalAmt: subTotalAmt.toString(),
         totalAmt: totalAmt.toString(),
+        payment_type: "web"
       },
       line_items: line_items,
       success_url: `${process.env.FRONTEND_URL}/success`,
@@ -146,10 +147,11 @@ export async function mobilePaymentController(request, response) {
       payment_method_types: ["card"],
       receipt_email: user.email,
       metadata: {
-        userId: userId.toString(),
-        addressId: addressId ? addressId.toString() : "",
-        subTotalAmt: subTotalAmt.toString(),
-        totalAmt: totalAmt.toString(),
+        userId: String(userId),
+        addressId: addressId ? String(addressId) : "",
+        subTotalAmt: String(subTotalAmt),
+        totalAmt: String(totalAmt),
+        payment_type: "mobile"
       },
     });
 
@@ -229,10 +231,14 @@ export async function webhookStripe(request, response) {
     return response.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  console.log(`Received Webhook Event: ${event.type}`);
+
   switch (event.type) {
     case "checkout.session.completed": {
       const session = event.data.object;
       const { userId, addressId, subTotalAmt, totalAmt } = session.metadata;
+
+      console.log(`Processing Web Order for User: ${userId}`);
 
       await processOrderAndClearCart({
         userId,
@@ -247,18 +253,21 @@ export async function webhookStripe(request, response) {
 
     case "payment_intent.succeeded": {
       const paymentIntent = event.data.object;
+      const { userId, addressId, subTotalAmt, totalAmt, payment_type } = paymentIntent.metadata;
 
-      // Ignore payment intents created by Checkout sessions to avoid duplicate orders
-      if (paymentIntent.invoice || paymentIntent.metadata?.type === "checkout") {
+      // ONLY process payment_intent.succeeded if it came from the mobile app.
+      // Web orders are handled exclusively by 'checkout.session.completed'.
+      if (payment_type !== "mobile") {
+        console.log(`Skipping payment_intent.succeeded for non-mobile payment (${payment_type || "web"})`);
         break;
       }
-
-      const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
 
       if (!userId) {
         console.error("Missing userId in PaymentIntent metadata");
         break;
       }
+
+      console.log(`Processing Mobile Order for User: ${userId}`);
 
       await processOrderAndClearCart({
         userId,
