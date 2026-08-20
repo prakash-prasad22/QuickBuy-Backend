@@ -4,6 +4,7 @@ import dotenv from 'dotenv'
 dotenv.config()
 import cookieParser from 'cookie-parser'
 import helmet from 'helmet'
+import https from 'https'
 import connectDB from './config/connectDB.js'
 import userRouter from './route/user.route.js'
 import categoryRouter from './route/category.route.js'
@@ -33,12 +34,14 @@ app.use(helmet({
 }))
 
 const PORT = process.env.PORT || 8000
+const SERVER_URL = process.env.SERVER_URL
 
 // Basic route for testing
 app.get("/",(request,response)=>{
     ///server to client
     response.json({
-        message : "Server is running " + PORT
+        message : "Server is running " + PORT,
+        status : "active"
     })
 })
 
@@ -55,10 +58,23 @@ app.use('/api/home/bannerImage',bannerImageRouter)
 app.use('/api/wishlist',wishlistRouter)
 app.use('/api/review',reviewRouter)
 
+
+// Keep-Alive Self-Ping Function (Runs every 10 minutes)
+const keepAlive = () => {
+    setInterval(() => {
+        https.get(SERVER_URL, (res) => {
+            console.log(`Keep-alive ping sent to ${SERVER_URL} - Status: ${res.statusCode}`);
+        }).on('error', (err) => {
+            console.error('Keep-alive ping error:', err.message);
+        });
+    }, 10 * 60 * 1000); // 10 minutes
+}
+
 //start server
 connectDB().then(()=>{
     app.listen(PORT,()=>{
-        console.log("Server is running on PORT:",PORT)
+        console.log("Server is running on PORT:",PORT);
+        keepAlive();
     })
 })
 
