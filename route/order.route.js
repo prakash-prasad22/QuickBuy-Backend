@@ -7,6 +7,7 @@ import {
     getAllOrders, 
     getOrderDetailsController, 
     getSellerOrders, 
+    mobilePaymentController, 
     paymentController, 
     updateOrderStatus, 
     webhookStripe 
@@ -21,6 +22,9 @@ orderRouter.post("/cash-on-delivery",auth,CashOnDeliveryOrderController)
 
 // Process order payment (requires authentication)
 orderRouter.post('/checkout',auth,paymentController)
+
+// Payment for mobile application
+orderRouter.post("/create-payment-intent", auth, mobilePaymentController);
 
 // Handle Stripe webhook (for payment updates)
 orderRouter.post('/webhook',webhookStripe)

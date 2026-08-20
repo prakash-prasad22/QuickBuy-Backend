@@ -22,7 +22,7 @@ export const pricewithDiscount = (price,dis = 1)=>{
 /**
  * Handles Cash On Delivery orders and stock updation
  **/
- export async function CashOnDeliveryOrderController(request,response){
+export async function CashOnDeliveryOrderController(request,response){
     try {
         const userId = request.userId // auth middleware 
         const { list_items, totalAmt, addressId,subTotalAmt } = request.body 
@@ -147,6 +147,54 @@ export async function paymentController(request,response){
     }
 }
 
+/**
+ * Handles Native Mobile Stripe Payment Intent
+ */
+export async function mobilePaymentController(request, response) {
+  try {
+    const userId = request.userId; // from auth middleware
+    const { list_items, totalAmt, addressId, subTotalAmt } = request.body;
+
+    const user = await UserModel.findById(userId);
+
+    if (!user) {
+      return response.status(404).json({
+        message: "User not found",
+        error: true,
+        success: false,
+      });
+    }
+
+    // 1. Create a PaymentIntent directly with Stripe
+    const paymentIntent = await Stripe.paymentIntents.create({
+      amount: Math.round(Number(totalAmt) * 100), // Stripe expects amounts in paisa
+      currency: "inr",
+      payment_method_types: ["card"],
+      receipt_email: user.email,
+      metadata: {
+        userId: userId.toString(),
+        addressId: addressId ? addressId.toString() : "",
+        subTotalAmt: subTotalAmt.toString(),
+        totalAmt: totalAmt.toString(),
+      },
+    });
+
+    // 2. Return client_secret to native app
+    return response.status(200).json({
+      message: "Payment intent created successfully",
+      client_secret: paymentIntent.client_secret,
+      error: false,
+      success: true,
+    });
+  } catch (error) {
+    return response.status(500).json({
+      message: error.message || error,
+      error: true,
+      success: false,
+    });
+  }
+}
+
 
 const getOrderProductItems = async({
     lineItems,
@@ -205,7 +253,7 @@ export async function webhookStripe(request,response){
 
     // Handle the event
   switch (event.type) {
-    case 'checkout.session.completed':
+    case 'checkout.session.completed': {
       const session = event.data.object;
       const lineItems = await Stripe.checkout.sessions.listLineItems(session.id)
       const userId = session.metadata.userId
@@ -236,6 +284,46 @@ export async function webhookStripe(request,response){
             const removeCartProductDB = await CartProductModel.deleteMany({ userId : userId})
         }
       break;
+      }
+    case 'payment_intent.succeeded': {
+      const paymentIntent = event.data.object;
+      const { userId, addressId, subTotalAmt, totalAmt } = paymentIntent.metadata;
+
+      // Fetch user's active cart to map items to the order
+      const cartItems = await CartProductModel.find({ userId }).populate('productId');
+
+      const orderPayload = cartItems.map((item) => ({
+        userId,
+        orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+        productId: item.productId._id,
+        product_details: {
+          name: item.productId.name,
+          image: item.productId.image,
+          seller: item.productId.seller,
+          deliveryOptions: item.productId.category[0]?.deliveryOptions,
+          price: pricewithDiscount(item.productId.price, item.productId.discount),
+        },
+        paymentId: paymentIntent.id,
+        payment_status: "PAID",
+        delivery_address: addressId,
+        quantity: item.quantity,
+        subTotalAmt: Number(subTotalAmt),
+        totalAmt: Number(totalAmt),
+      }));
+
+      const orders = await OrderModel.insertMany(orderPayload);
+
+      // Update Stock & Clear Cart
+      for (const orderItem of orders) {
+        await ProductModel.findByIdAndUpdate(orderItem.productId, {
+          $inc: { stock: -orderItem.quantity },
+        });
+      }
+
+      await CartProductModel.deleteMany({ userId });
+      await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
+      break;
+    }
     default:
       console.log(`Unhandled event type ${event.type}`);
   }
