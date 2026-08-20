@@ -27,7 +27,7 @@ orderRouter.post('/checkout',auth,paymentController)
 orderRouter.post("/create-payment-intent", auth, mobilePaymentController);
 
 // Handle Stripe webhook (for payment updates)
-orderRouter.post('/webhook',webhookStripe)
+orderRouter.post('/webhook',express.raw({ type: 'application/json' }),webhookStripe)
 
 // Get order details (requires authentication)
 orderRouter.get("/order-list",auth,getOrderDetailsController)
